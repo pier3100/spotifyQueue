@@ -1,25 +1,44 @@
-from email.mime import audio
+# standard library
 import re
-from rapidfuzz import fuzz
 from pathlib import Path
 from datetime import datetime as dt, timezone
+from time import sleep
+import os
+
+# third-party
+from rapidfuzz import fuzz
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from mutagen import File as MutagenFile
 
-## Configuration
+## --- Setup ---
+os.chdir(os.path.dirname(__file__)) # ensure we run in the script's directory, so relative paths work correctly
+
+## --- Configuration ---
 QUEUE_PLAYLIST_NAME = "Maybe Set1"
 DOWNLOADED_PLAYLIST_NAME = "Set1 Gedownload"
 MUSIC_ROOT = Path("C:/Users/piert/Music/Antra")
 AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".wav", ".ogg"}
 
 ## --- Spotify API Setup ---
-sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
+auth_manager = SpotifyOAuth(
     client_id="6558af35dbf74e2581a1270394bfa7e4",
     client_secret="ee21bfa990d143a6a0897e5d70569145",
     redirect_uri="http://127.0.0.1:36914/spotify",
     scope="playlist-modify-public"
-))
+)
+
+print("Authenticating with Spotify...")
+token_info = auth_manager.get_cached_token()
+if not token_info:
+    print("No cached token → logging in...")
+    auth_manager.get_access_token()
+    sleep(1)  # wait a moment for the token to be cached
+
+print("Authentication ready.")
+
+sp = spotipy.Spotify(auth_manager=auth_manager)
+print(f"Logged in as: {sp.current_user()['display_name']}")
 
 def find_playlist_id_by_name(name):
     results = sp.current_user_playlists(limit=50)
@@ -257,6 +276,7 @@ def move_track(sp, track_ids, queue_playlist_id, downloaded_playlist_id):
     1. adds track to downloaded playlist
     2. removes track from queue playlist
     """
+    count = 0;
 
     for track_id in track_ids:
 
@@ -278,11 +298,14 @@ def move_track(sp, track_ids, queue_playlist_id, downloaded_playlist_id):
             [track_uri]
         )
 
+        count += 1
+
         # --- yield confirmation ---
         yield {
             "track_id": track_id,
             "title": title,
-            "artists": artists
+            "artists": artists,
+            "count": count
         }
 
 
@@ -291,15 +314,19 @@ queue_playlist_id = find_playlist_id_by_name(QUEUE_PLAYLIST_NAME)
 downloaded_playlist_id = find_playlist_id_by_name(DOWNLOADED_PLAYLIST_NAME)
 spotify_tracks_queue = get_playlist_tracks(queue_playlist_id)
 CUTOFF = get_playlist_first_entry_time(spotify_tracks_queue)
+print("First entry in queue playlist added at:", CUTOFF.isoformat())
+print("Checking all local files modified since then... and matching to Spotify tracks in the queue playlist... at match I move the track to the", DOWNLOADED_PLAYLIST_NAME, "playlist and remove it from the", QUEUE_PLAYLIST_NAME, "playlist...")
 
+last_count = 0;
 for output in move_track(sp, match_to_spotify(extract_track_info(get_recent_files()), spotify_tracks_queue), queue_playlist_id, downloaded_playlist_id):
     print("moved: ",output["track_id"], "-", output["title"], "by", ", ".join(output["artists"]))
+    last_count = output["count"]
 
 ## --- Verify results ---
 spotify_tracks_queue = get_playlist_tracks(queue_playlist_id)
-for track in spotify_tracks_queue:
-    print("in queue: ", track["id"], "-", track["title"], "by", ", ".join(track["artists"]))
 
-spotify_tracks_downloaded = get_playlist_tracks(downloaded_playlist_id)
-for track in spotify_tracks_downloaded:
-    print("in downloaded: ", track["id"], "-", track["title"], "by", ", ".join(track["artists"]))
+for track in spotify_tracks_queue:
+    print("left in queue: ", track["id"], "-", track["title"], "by", ", ".join(track["artists"]))
+
+print(" ")
+print("DONE:         moved:", last_count, "           left in queue: ", len(spotify_tracks_queue))
