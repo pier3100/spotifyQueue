@@ -4,6 +4,7 @@ from pathlib import Path
 from datetime import datetime as dt, timezone
 from time import sleep
 import os
+import json
 
 # third-party
 from rapidfuzz import fuzz
@@ -15,45 +16,76 @@ from mutagen import File as MutagenFile
 os.chdir(os.path.dirname(__file__)) # ensure we run in the script's directory, so relative paths work correctly
 
 ## --- Configuration ---
-QUEUE_PLAYLIST_NAME = "Maybe Set1"
-DOWNLOADED_PLAYLIST_NAME = "Set1 Gedownload"
-MUSIC_ROOT = Path("C:/Users/piert/Music/Antra")
-AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".wav", ".ogg"}
+def load_config(path="config.json"):
+    try:
+        with open(path, "r") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        raise RuntimeError(f"Config file not found: {path}")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Invalid JSON: {e}")
+
+    # --- Basic validation ---
+    required_keys = ["playlists", "paths", "audio", "spotify"]
+    for key in required_keys:
+        if key not in cfg:
+            raise RuntimeError(f"Missing top-level key: '{key}'")
+        
+    # --- Validate playlists config ---
+    validate_spotify_playlist_url(cfg["playlists"].get("queue_url", ""))
+    validate_spotify_playlist_url(cfg["playlists"].get("downloaded_url", ""))
+
+    # --- Extract + convert ---
+    try:
+        cfg["paths"]["music_root"] = Path(cfg["paths"]["music_root"])
+        cfg["audio"]["extensions"] = set(cfg["audio"]["extensions"])
+    except KeyError as e:
+        raise RuntimeError(f"Missing config key: {e}")
+
+    return cfg
+
+def validate_spotify_playlist_url(url: str):
+    if not isinstance(url, str):
+        raise ValueError("Playlist URL must be a string")
+
+    if "open.spotify.com/playlist/" not in url:
+        raise ValueError(f"Invalid Spotify playlist URL: {url}")
+    
+config = load_config()
+
+QUEUE_PLAYLIST_URL = config["playlists"]["queue_url"]
+DOWNLOADED_PLAYLIST_URL = config["playlists"]["downloaded_url"]
+MUSIC_ROOT = config["paths"]["music_root"]
+AUDIO_EXTENSIONS = config["audio"]["extensions"]
+spotify_cfg = config["spotify"]
 
 ## --- Spotify API Setup ---
 auth_manager = SpotifyOAuth(
-    client_id="6558af35dbf74e2581a1270394bfa7e4",
-    client_secret="ee21bfa990d143a6a0897e5d70569145",
-    redirect_uri="http://127.0.0.1:36914/spotify",
-    scope="playlist-modify-public"
+    client_id=spotify_cfg["client_id"],
+    client_secret=spotify_cfg["client_secret"],
+    redirect_uri=spotify_cfg["redirect_uri"],
+    scope=" ".join(spotify_cfg["scope"]),
 )
 
-print("Authenticating with Spotify...")
+print("f\nAuthenticating with Spotify...")
 token_info = auth_manager.get_cached_token()
 if not token_info:
     print("No cached token → logging in...")
     auth_manager.get_access_token()
-    sleep(1)  # wait a moment for the token to be cached
 
 print("Authentication ready.")
 
 sp = spotipy.Spotify(auth_manager=auth_manager)
 print(f"Logged in as: {sp.current_user()['display_name']}")
 
-def find_playlist_id_by_name(name):
-    results = sp.current_user_playlists(limit=50)
+def get_playlist_from_url(sp, url: str):
+    playlist_id = url.split("playlist/")[1].split("?")[0].split("/")[0]
+    playlist = sp.playlist(playlist_id)
 
-    while results:
-        for playlist in results["items"]:
-            if playlist["name"].lower() == name.lower():
-                return playlist["id"]
-
-        if results["next"]:
-            results = sp.next(results)
-        else:
-            break
-    raise ValueError(f"Playlist '{name}' not found")
-    return None
+    return {
+        "id": playlist["id"],
+        "name": playlist["name"]
+    }
 
 def get_playlist_tracks(id):
     results = sp.playlist_items(
@@ -98,6 +130,9 @@ def get_playlist_first_entry_time(tracks):
 
 ## --- Local file discovery ---
 def get_recent_files():
+    count_total = 0
+    count_to_check = 0
+
     for path in MUSIC_ROOT.rglob("*"):
         if not path.is_file():
             continue
@@ -110,7 +145,10 @@ def get_recent_files():
             tz=timezone.utc
         )
 
+        count_total += 1
+        
         if file_time >= CUTOFF:
+            count_to_check += 1
             yield path
 
 def extract_track_info(paths):
@@ -250,26 +288,7 @@ def score(local_track, spotify_track) -> float:
 
     return final_score
 
-## --- Testing ---
-def fetch_spotify_track_info(sp, track_ids):
-    """
-    Generator:
-    input: iterable of spotify track IDs
-    output: (title, artists)
-    """
-
-    for track_id in track_ids:
-        track = sp.track(track_id)
-
-        title = track["name"]
-        artists = [a["name"] for a in track["artists"]]
-
-        yield {
-            "track_id": track_id,
-            "title": title,
-            "artists": artists
-        }
-
+## --- Moving tracks ---
 def move_track(sp, track_ids, queue_playlist_id, downloaded_playlist_id):
     """
     Generator that:
@@ -308,25 +327,55 @@ def move_track(sp, track_ids, queue_playlist_id, downloaded_playlist_id):
             "count": count
         }
 
+## --- Testing ---
+def fetch_spotify_track_info(sp, track_ids):
+    """
+    Generator:
+    input: iterable of spotify track IDs
+    output: (title, artists)
+    """
+
+    for track_id in track_ids:
+        track = sp.track(track_id)
+
+        title = track["name"]
+        artists = [a["name"] for a in track["artists"]]
+
+        yield {
+            "track_id": track_id,
+            "title": title,
+            "artists": artists
+        }
 
 ## --- Main logic ---
-queue_playlist_id = find_playlist_id_by_name(QUEUE_PLAYLIST_NAME)
-downloaded_playlist_id = find_playlist_id_by_name(DOWNLOADED_PLAYLIST_NAME)
-spotify_tracks_queue = get_playlist_tracks(queue_playlist_id)
+queue_playlist = get_playlist_from_url(sp, QUEUE_PLAYLIST_URL)
+downloaded_playlist = get_playlist_from_url(sp, DOWNLOADED_PLAYLIST_URL)
+spotify_tracks_queue = get_playlist_tracks(queue_playlist["id"])
 CUTOFF = get_playlist_first_entry_time(spotify_tracks_queue)
-print("First entry in queue playlist added at:", CUTOFF.isoformat())
-print("Checking all local files modified since then... and matching to Spotify tracks in the queue playlist... at match I move the track to the", DOWNLOADED_PLAYLIST_NAME, "playlist and remove it from the", QUEUE_PLAYLIST_NAME, "playlist...")
 
-last_count = 0;
-for output in move_track(sp, match_to_spotify(extract_track_info(get_recent_files()), spotify_tracks_queue), queue_playlist_id, downloaded_playlist_id):
+print(
+    f"\nDo you want me to move all tracks which I can find already in the search path,\n"
+    f"from playlist '{queue_playlist['name']}' to playlist '{downloaded_playlist['name']}'?"
+)
+
+answer = input("Type y/n: ").strip().lower()
+
+if answer != "y":
+    print("Aborted.")
+    exit()
+
+print("First entry in queue playlist added at:", CUTOFF.isoformat())
+
+last_count_moved = 0;
+for output in move_track(sp, match_to_spotify(extract_track_info(get_recent_files()), spotify_tracks_queue), queue_playlist["id"], downloaded_playlist["id"]):
     print("moved: ",output["track_id"], "-", output["title"], "by", ", ".join(output["artists"]))
-    last_count = output["count"]
+    last_count_moved = output["count"]
 
 ## --- Verify results ---
-spotify_tracks_queue = get_playlist_tracks(queue_playlist_id)
+spotify_tracks_queue = get_playlist_tracks(queue_playlist["id"])
 
 for track in spotify_tracks_queue:
     print("left in queue: ", track["id"], "-", track["title"], "by", ", ".join(track["artists"]))
 
-print(" ")
-print("DONE:         moved:", last_count, "           left in queue: ", len(spotify_tracks_queue))
+print("f\nDONE \n Local files with created time after", CUTOFF.isoformat(), "have been checked against the Spotify queue playlist.\n")
+print("f\n Total local audio files: \t","local audio files checked:","      moved:", last_count_moved, "           left in queue: ", len(spotify_tracks_queue))
