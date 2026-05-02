@@ -67,7 +67,7 @@ auth_manager = SpotifyOAuth(
     scope=" ".join(spotify_cfg["scope"]),
 )
 
-print("f\nAuthenticating with Spotify...")
+print(f"\nAuthenticating with Spotify...")
 token_info = auth_manager.get_cached_token()
 if not token_info:
     print("No cached token → logging in...")
@@ -84,7 +84,8 @@ def get_playlist_from_url(sp, url: str):
 
     return {
         "id": playlist["id"],
-        "name": playlist["name"]
+        "name": playlist["name"],
+        "track_count": playlist["tracks"]["total"]
     }
 
 def get_playlist_tracks(id):
@@ -131,7 +132,7 @@ def get_playlist_first_entry_time(tracks):
 ## --- Local file discovery ---
 def get_recent_files():
     count_total = 0
-    count_to_check = 0
+    files = []
 
     for path in MUSIC_ROOT.rglob("*"):
         if not path.is_file():
@@ -148,13 +149,22 @@ def get_recent_files():
         count_total += 1
         
         if file_time >= CUTOFF:
-            count_to_check += 1
-            yield path
+             files.append(path)
+
+    return {
+        "files": files or [],
+        "count_total": count_total,
+        "count_to_check": len(files)
+    }
 
 def extract_track_info(paths):
     """
-    Generator that converts file paths → (artist, title, duration)
+    Function that converts file paths → (artist, title, duration)
     """
+    if not paths:
+        return []
+    
+    tracks = []
 
     for path in paths:
         audio = MutagenFile(path, easy=True)
@@ -163,15 +173,12 @@ def extract_track_info(paths):
             continue
 
         # --- title ---
-        title = (audio.get("title", [None])[0]
-                 or path.stem)
+        title = (audio.get("title", [None])[0] or path.stem)
         title_norm = normalize(title)
 
         # --- artist ---
         artists = audio.get("artist", ["Unknown"])
-        artists_norm = " ".join(
-            sorted(normalize(a) for a in artists)
-        )
+        artists_norm = " ".join(sorted(normalize(a) for a in artists))
 
         # --- duration ---
         duration_ms = None
@@ -182,14 +189,17 @@ def extract_track_info(paths):
             if length and length > 0: ## MUTAGEN sometimes returns length=0 for unknown formats, so we check for that
                 duration_ms = int(length * 1000)
 
-        yield {
+        ## --- collect track info ---
+        tracks.append({
             "artists": artists,
             "artists_norm": artists_norm,
             "title": title,
             "title_norm": title_norm,
             "duration_ms": duration_ms,
             "path": path
-        }
+        })
+
+    return tracks
 
 ## --- Matching ---
 JUNK_PATTERNS = [
@@ -213,12 +223,20 @@ def normalize(s: str) -> str:
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
-from rapidfuzz import fuzz
 
 def match_to_spotify(local_tracks, spotify_tracks, threshold=88):
     """
-    Yields spotify track IDs for matched local tracks
+    Returns spotify track IDs for matched local tracks
     """
+    if not local_tracks or not spotify_tracks:
+        return {
+            "matches": [],
+            "unmatched_count": len(local_tracks or []),
+            "matched_count": 0
+        }
+
+    matches = []
+    unmatched = 0
 
     for local in local_tracks:
 
@@ -261,71 +279,85 @@ def match_to_spotify(local_tracks, spotify_tracks, threshold=88):
 
         # --- FINAL DECISION ---
         if best_score >= threshold:
-            yield best_id
+            matches.append({
+                "spotify_id": best_id,
+                "score": best_score,
+                "local": local
+            })
+        else:
+            unmatched += 1
 
-def score(local_track, spotify_track) -> float:
-    """
-    local_track: object with .artist and .title
-    spotify_track: dict from Spotify API
-    """
-
-    # --- Extract fields ---
-    local_artist = normalize(local_track.artist)
-    local_title = normalize(local_track.title)
-
-    spotify_artist = normalize(
-        " ".join(a["name"] for a in spotify_track["artists"])
-    )
-    spotify_title = normalize(spotify_track["name"])
-
-    # --- Compute scores ---
-    artist_score = fuzz.token_set_ratio(local_artist, spotify_artist)
-    title_score = fuzz.token_set_ratio(local_title, spotify_title)
-
-    # --- Combine ---
-    # Title matters slightly more than artist
-    final_score = 0.6 * title_score + 0.4 * artist_score
-
-    return final_score
+    return {
+        "matches": matches,
+        "unmatched_count": unmatched,
+        "matched_count": len(matches)
+    }
+        
 
 ## --- Moving tracks ---
 def move_track(sp, track_ids, queue_playlist_id, downloaded_playlist_id):
     """
-    Generator that:
+    Function that:
     1. adds track to downloaded playlist
     2. removes track from queue playlist
     """
-    count = 0;
+    if not track_ids:
+        return {
+            "moved": 0,
+            "failed": 0,
+            "results": []
+        }
+
+    results = []
+    moved = 0
+    failed = 0
 
     for track_id in track_ids:
 
-        track_uri = f"spotify:track:{track_id}"
-        track = sp.track(track_id)
+        try:
+            track_uri = f"spotify:track:{track_id}"
+            track = sp.track(track_id)
 
-        title = track["name"]
-        artists = [a["name"] for a in track["artists"]]
+            title = track["name"]
+            artists = [a["name"] for a in track["artists"]]
 
-        # --- 1. ADD TO DOWNLOADED PLAYLIST ---
-        sp.playlist_add_items(
-            downloaded_playlist_id,
-            [track_uri]
-        )
+            # --- ADD TO DOWNLOADED ---
+            sp.playlist_add_items(
+                downloaded_playlist_id,
+                [track_uri]
+            )
 
-        # --- 2. REMOVE FROM SOURCE PLAYLIST ---
-        sp.playlist_remove_all_occurrences_of_items(
-            queue_playlist_id,
-            [track_uri]
-        )
+            # --- REMOVE FROM QUEUE ---
+            sp.playlist_remove_all_occurrences_of_items(
+                queue_playlist_id,
+                [track_uri]
+            )
 
-        count += 1
+            moved += 1
 
-        # --- yield confirmation ---
-        yield {
-            "track_id": track_id,
-            "title": title,
-            "artists": artists,
-            "count": count
-        }
+            results.append({
+                "track_id": track_id,
+                "title": title,
+                "artists": artists,
+                "status": "moved",
+                "count": moved
+            })
+
+        except Exception as e:
+            failed += 1
+
+            results.append({
+                "track_id": track_id,
+                "status": "failed",
+                "error": str(e),
+                "count": moved
+            })
+
+    return {
+        "moved": moved,
+        "failed": failed,
+        "results": results
+    }
 
 ## --- Testing ---
 def fetch_spotify_track_info(sp, track_ids):
@@ -353,29 +385,49 @@ downloaded_playlist = get_playlist_from_url(sp, DOWNLOADED_PLAYLIST_URL)
 spotify_tracks_queue = get_playlist_tracks(queue_playlist["id"])
 CUTOFF = get_playlist_first_entry_time(spotify_tracks_queue)
 
+width_name = max(len(queue_playlist["name"]), len(downloaded_playlist["name"])) + 8
+width_count = max(len(str(queue_playlist["track_count"])), len(str(downloaded_playlist["track_count"]))) + 1
 print(
-    f"\nDo you want me to move all tracks which I can find already in the search path,\n"
-    f"from playlist '{queue_playlist['name']}' to playlist '{downloaded_playlist['name']}'?"
+    f"\nDo you want me to move all tracks which I can find already in the search path,"
+    f"\nfrom queue playlist to downloaded playlist?"
+    f"\n\nQueue playlist:\t\t{queue_playlist['name']:{width_name}}  {queue_playlist['track_count']:{width_count}} tracks"
+    f"\nDownloaded playlist:\t{downloaded_playlist['name']:{width_name}}  {downloaded_playlist['track_count']:{width_count}} tracks"
 )
 
-answer = input("Type y/n: ").strip().lower()
-
+answer = input(f"\nType y/n: ").strip().lower()
 if answer != "y":
     print("Aborted.")
     exit()
 
-print("First entry in queue playlist added at:", CUTOFF.isoformat())
+print(f"\nFirst entry in queue playlist added at: {CUTOFF.isoformat()}, using this as cutoff date.")
 
-last_count_moved = 0;
-for output in move_track(sp, match_to_spotify(extract_track_info(get_recent_files()), spotify_tracks_queue), queue_playlist["id"], downloaded_playlist["id"]):
-    print("moved: ",output["track_id"], "-", output["title"], "by", ", ".join(output["artists"]))
-    last_count_moved = output["count"]
+scan = get_recent_files()
+print(f"\nFound\t\t{scan['count_total']} \t total audio files under {MUSIC_ROOT},")
+print(f"To check\t{scan['count_to_check']} \t against the Spotify queue playlist, as they have been created after the cutoff date.")
+
+tracks = extract_track_info(scan["files"])
+print(f"\nExtracted track info for local files, now matching against Spotify...")
+
+match_result = match_to_spotify(tracks, spotify_tracks_queue)
+print(
+    f"\nMatched\t\t{match_result['matched_count']} \t local files with a spotify track."
+    f"\nUnmatched\t{match_result['unmatched_count']} \t local files.")
+
+move_stats = move_track(sp, [m["spotify_id"] for m in match_result["matches"]], queue_playlist["id"], downloaded_playlist["id"])
+print(
+    f"\nMoved\t\t{move_stats['moved']} \t tracks to downloaded playlist."
+    f"\nFailed\t\t{move_stats['failed']} \t tracks to move."
+)
+
+queue_playlist = get_playlist_from_url(sp, QUEUE_PLAYLIST_URL)
+print(
+    f"\nDone."
+    f"\nLeft in queue\t{queue_playlist['track_count']} \t tracks."
+)
 
 ## --- Verify results ---
-spotify_tracks_queue = get_playlist_tracks(queue_playlist["id"])
+""" spotify_tracks_queue = get_playlist_tracks(queue_playlist["id"])
 
 for track in spotify_tracks_queue:
     print("left in queue: ", track["id"], "-", track["title"], "by", ", ".join(track["artists"]))
-
-print("f\nDONE \n Local files with created time after", CUTOFF.isoformat(), "have been checked against the Spotify queue playlist.\n")
-print("f\n Total local audio files: \t","local audio files checked:","      moved:", last_count_moved, "           left in queue: ", len(spotify_tracks_queue))
+ """
